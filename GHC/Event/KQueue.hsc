@@ -85,21 +85,21 @@ new = do
 delete :: KQueue -> IO ()
 delete q = void $ c_close . fromQueueFd . kqueueFd $ q
 
+flagsToAdd = flagAdd .|. flagDispatch .|. flagEnable
+
 modifyFd :: KQueue -> Fd -> E.Event -> E.Event -> IO ()
 modifyFd kq fd oevt nevt
   | nevt == mempty = do
       let !ev = event fd (toFilter oevt) flagDelete noteEOF
       kqueueControl (kqueueFd kq) ev
   | otherwise      = do
-      let !ev = event fd (toFilter nevt) (flagAdd .|. flagDispatch) noteEOF
+      let !ev = event fd (toFilter nevt) flagsToAdd noteEOF
       kqueueControl (kqueueFd kq) ev
 
 modifyFdOnce :: KQueue -> Fd -> E.Event -> IO ()
 modifyFdOnce kq fd evt = do
-    let !ev = event fd (toFilter evt) flag noteEOF
+    let !ev = event fd (toFilter evt) flagsToAdd noteEOF
     kqueueControl (kqueueFd kq) ev
-  where
-    flag = flagAdd .|. flagDispatch
 
 toFilter :: E.Event -> Filter
 toFilter evt
@@ -251,6 +251,7 @@ newtype Flag = Flag Word16
 #{enum Flag, Flag
  , flagAdd      = EV_ADD
  , flagDelete   = EV_DELETE
+ , flagEnable   = EV_ENABLE
  , flagOneshot  = EV_ONESHOT
  , flagDispatch = EV_DISPATCH
  }
