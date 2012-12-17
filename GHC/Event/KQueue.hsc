@@ -91,7 +91,7 @@ modifyFd kq fd oevt nevt
       let !ev = event fd (toFilter oevt) flagDelete noteEOF
       kqueueControl (kqueueFd kq) ev
   | otherwise      = do
-      let !ev = event fd (toFilter nevt) (flagAdd .|. flagOneshot) noteEOF
+      let !ev = event fd (toFilter nevt) (flagAdd .|. flagDispatch) noteEOF
       kqueueControl (kqueueFd kq) ev
 
 modifyFdOnce :: KQueue -> Fd -> E.Event -> IO ()
@@ -99,7 +99,7 @@ modifyFdOnce kq fd evt = do
     let !ev = event fd (toFilter evt) flag noteEOF
     kqueueControl (kqueueFd kq) ev
   where
-    flag = flagAdd .|. flagOneshot
+    flag = flagAdd .|. flagDispatch
 
 toFilter :: E.Event -> Filter
 toFilter evt
@@ -249,9 +249,10 @@ newtype Flag = Flag Word16
     deriving (Bits, Eq, Num, Show, Storable)
 
 #{enum Flag, Flag
- , flagAdd     = EV_ADD
- , flagDelete  = EV_DELETE
- , flagOneshot = EV_ONESHOT
+ , flagAdd      = EV_ADD
+ , flagDelete   = EV_DELETE
+ , flagOneshot  = EV_ONESHOT
+ , flagDispatch = EV_DISPATCH
  }
 
 newtype Filter = Filter Word16
