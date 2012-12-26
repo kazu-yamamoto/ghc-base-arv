@@ -50,7 +50,7 @@ module GHC.Event.Manager
 
 import Control.Concurrent.MVar (MVar, modifyMVar, newMVar, readMVar)
 import Control.Exception (finally)
-import Control.Monad ((=<<), forM_, liftM, sequence_, when, replicateM, void)
+import Control.Monad ((=<<), forM_, liftM, when, replicateM)
 import Data.IORef (IORef, atomicModifyIORef, mkWeakIORef, newIORef, readIORef,
                    writeIORef)
 import Data.Maybe (Maybe(..))
@@ -281,11 +281,10 @@ registerFd mgr cb fd evs = do
 
 -- | Wake up the event manager.
 wakeManager :: EventManager -> IO ()
-wakeManager mgr =
 #if defined(HAVE_EPOLL) || defined(HAVE_KQUEUE)
-  return ()
+wakeManager _ = return ()
 #else
-  sendWakeup (emControl mgr)
+wakeManager mgr = sendWakeup (emControl mgr)
 #endif
 
 eventsOf :: [FdData] -> Event
