@@ -123,7 +123,7 @@ threadWait evt fd = mask_ $ do
 threadWaitSTM :: Event -> Fd -> IO (STM (), IO ())
 threadWaitSTM evt fd = mask_ $ do
   m <- newTVarIO Nothing
-  mgr <- getSystemEventManager 
+  mgr <- getSystemEventManager
   reg <- registerFd mgr (\_ e -> atomically (writeTVar m (Just e))) fd evt
   let waitAction =
         do mevt <- readTVar m
@@ -138,7 +138,7 @@ threadWaitSTM evt fd = mask_ $ do
 -- | Allows a thread to use an STM action to wait for a file descriptor to be readable.
 -- The STM action will retry until the file descriptor has data ready.
 -- The second element of the return value pair is an IO action that can be used
--- to deregister interest in the file descriptor. 
+-- to deregister interest in the file descriptor.
 --
 -- The STM action will throw an 'IOError' if the file descriptor was closed
 -- while the STM action is being executed.  To safely close a file descriptor
@@ -150,7 +150,7 @@ threadWaitReadSTM = threadWaitSTM evtRead
 -- | Allows a thread to use an STM action to wait until a file descriptor can accept a write.
 -- The STM action will retry while the file until the given file descriptor can accept a write.
 -- The second element of the return value pair is an IO action that can be used to deregister
--- interest in the file descriptor. 
+-- interest in the file descriptor.
 --
 -- The STM action will throw an 'IOError' if the file descriptor was closed
 -- while the STM action is being executed.  To safely close a file descriptor
@@ -190,7 +190,7 @@ ioManagerLock = unsafePerformIO $ do
    sharedCAF m getOrSetSystemEventThreadIOManagerThreadStore
 
 getSystemTimerManager :: IO TM.TimerManager
-getSystemTimerManager = do 
+getSystemTimerManager = do
   Just mgr <- readIORef timerManager
   return mgr
 
@@ -224,7 +224,7 @@ startIOManagerThreads :: IO ()
 startIOManagerThreads =
   modifyMVar_ ioManagerLock $ \_ ->
   forM_ [0,1..numCapabilities-1] startIOManagerThread
-  
+
 startIOManagerThread :: Int -> IO ()
 startIOManagerThread i = do
   let create = do
@@ -239,7 +239,7 @@ startIOManagerThread i = do
       s <- threadStatus t
       case s of
         ThreadFinished -> create
-        ThreadDied     -> do 
+        ThreadDied     -> do
           -- Sanity check: if the thread has died, there is a chance
           -- that event manager is still alive. This could happend during
           -- the fork, for example. In this case we should clean up
@@ -263,7 +263,7 @@ startTimerManagerThread = modifyMVar_ timerManagerThreadVar $ \old -> do
       s <- threadStatus t
       case s of
         ThreadFinished -> create
-        ThreadDied     -> do 
+        ThreadDied     -> do
           -- Sanity check: if the thread has died, there is a chance
           -- that event manager is still alive. This could happend during
           -- the fork, for example. In this case we should clean up
