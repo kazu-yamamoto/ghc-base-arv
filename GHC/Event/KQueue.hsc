@@ -28,9 +28,10 @@ available = False
 {-# INLINE available #-}
 #else
 
-import Control.Concurrent.MVar (MVar, newMVar, swapMVar, withMVar)
-import Control.Monad (when, unless)
+import Control.Monad (when, void)
 import Data.Bits (Bits(..))
+import Data.Maybe (Maybe(..))
+import Data.Monoid (Monoid(..))
 import Data.Word (Word16, Word32)
 import Foreign.C.Error (throwErrnoIfMinus1)
 import Foreign.C.Types
@@ -75,17 +76,14 @@ available = True
 
 data EventQueue = EventQueue {
       eqFd       :: {-# UNPACK #-} !QueueFd
-    , eqChanges  :: {-# UNPACK #-} !(MVar (A.Array Event))
     , eqEvents   :: {-# UNPACK #-} !(A.Array Event)
     }
 
 new :: IO E.Backend
 new = do
   qfd <- kqueue
-  changesArr <- A.empty
-  changes <- newMVar changesArr 
   events <- A.new 64
-  let !be = E.backend poll modifyFd delete (EventQueue qfd changes events)
+  let !be = E.backend poll modifyFd modifyFdOnce delete (EventQueue qfd events)
   return be
 
 delete :: EventQueue -> IO ()
@@ -94,33 +92,40 @@ delete q = do
   return ()
 
 modifyFd :: EventQueue -> Fd -> E.Event -> E.Event -> IO ()
-modifyFd q fd oevt nevt = withMVar (eqChanges q) $ \ch -> do
-  let addChange filt flag = A.snoc ch $ event fd filt flag noteEOF
-  when (oevt `E.eventIs` E.evtRead)  $ addChange filterRead flagDelete
-  when (oevt `E.eventIs` E.evtWrite) $ addChange filterWrite flagDelete
-  when (nevt `E.eventIs` E.evtRead)  $ addChange filterRead flagAdd
-  when (nevt `E.eventIs` E.evtWrite) $ addChange filterWrite flagAdd
+modifyFd q fd oevt nevt
+  | nevt == mempty = do
+      let !ev = event fd (toFilter oevt) flagDelete noteEOF
+      kqueueControl (eqFd q) ev
+  | otherwise      = do
+      let !ev = event fd (toFilter nevt) flagAdd noteEOF
+      kqueueControl (eqFd q) ev
+
+toFilter :: E.Event -> Filter
+toFilter evt
+  | evt `E.eventIs` E.evtRead = filterRead
+  | otherwise                 = filterWrite
+
+modifyFdOnce :: EventQueue -> Fd -> E.Event -> IO ()
+modifyFdOnce q fd evt = do
+    let !ev = event fd (toFilter evt) (flagAdd .|. flagOneshot) noteEOF
+    kqueueControl (kqueueFd q) ev
 
 poll :: EventQueue
-     -> Timeout
+     -> Maybe Timeout
      -> (Fd -> E.Event -> IO ())
-     -> IO ()
-poll EventQueue{..} tout f = do
-    changesArr <- A.empty
-    changes <- swapMVar eqChanges changesArr
-    changesLen <- A.length changes
-    len <- A.length eqEvents
-    when (changesLen > len) $ A.ensureCapacity eqEvents (2 * changesLen)
-    n <- A.useAsPtr changes $ \changesPtr chLen ->
-           A.unsafeLoad eqEvents $ \evPtr evCap ->
-             withTimeSpec (fromTimeout tout) $
-               kevent eqFd changesPtr chLen evPtr evCap
-
-    unless (n == 0) $ do
+     -> IO Int
+poll EventQueue{..} mtout f = do
+    n <- A.unsafeLoad eqEvents $ \evp cap ->
+      case mtout of
+        Just tout -> withTimeSpec (fromTimeout tout) $
+                     kevent True eqFd nullPtr 0 evp cap
+        Nothing   -> withTimeSpec (TimeSpec 0 0) $
+                     kevent False eqFd nullPtr 0 evp cap
+    when (n > 0) $ do
         cap <- A.capacity eqEvents
         when (n == cap) $ A.ensureCapacity eqEvents (2 * cap)
         A.forM_ eqEvents $ \e -> f (fromIntegral (ident e)) (toEvent (filter e))
-
+    return n
 ------------------------------------------------------------------------
 -- FFI binding
 
@@ -222,11 +227,12 @@ newtype Flag = Flag Word32
 #else
 newtype Flag = Flag Word16
 #endif
-    deriving (Eq, Show, Storable)
+    deriving (Bits, Eq, Num, Show, Storable)
 
 #{enum Flag, Flag
  , flagAdd     = EV_ADD
  , flagDelete  = EV_DELETE
+ , flagOneshot = EV_ONESHOT
  }
 
 #if SIZEOF_KEV_FILTER == 4 /*kevent.filter: uint32_t or uint16_t. */
@@ -263,16 +269,25 @@ instance Storable TimeSpec where
 kqueue :: IO QueueFd
 kqueue = QueueFd `fmap` throwErrnoIfMinus1 "kqueue" c_kqueue
 
+kqueueControl :: KQueueFd -> Event -> IO ()
+kqueueControl kfd ev = void $
+    withTimeSpec (TimeSpec 0 0) $ \tp ->
+        withEvent ev $ \evp -> kevent False kfd evp 1 nullPtr 0 tp
+
 -- TODO: We cannot retry on EINTR as the timeout would be wrong.
 -- Perhaps we should just return without calling any callbacks.
-kevent :: QueueFd -> Ptr Event -> Int -> Ptr Event -> Int -> Ptr TimeSpec
+kevent :: Bool -> QueueFd -> Ptr Event -> Int -> Ptr Event -> Int -> Ptr TimeSpec
        -> IO Int
-kevent k chs chlen evs evlen ts
+kevent safe k chs chlen evs evlen ts
     = fmap fromIntegral $ E.throwErrnoIfMinus1NoRetry "kevent" $
 #if defined(HAVE_KEVENT64)
-      c_kevent64 k chs (fromIntegral chlen) evs (fromIntegral evlen) 0 ts
+      if safe
+      then c_kevent64 k chs (fromIntegral chlen) evs (fromIntegral evlen) 0 ts
+      else c_kevent64_unsafe k chs (fromIntegral chlen) evs (fromIntegral evlen) 0 ts
 #else
-      c_kevent k chs (fromIntegral chlen) evs (fromIntegral evlen) ts
+      if safe 
+      then c_kevent k chs (fromIntegral chlen) evs (fromIntegral evlen) ts
+      else c_kevent_unsafe k chs (fromIntegral chlen) evs (fromIntegral evlen) ts
 #endif
 
 withTimeSpec :: TimeSpec -> (Ptr TimeSpec -> IO a) -> IO a
@@ -305,13 +320,20 @@ foreign import ccall unsafe "kqueue"
 foreign import ccall safe "kevent64"
     c_kevent64 :: QueueFd -> Ptr Event -> CInt -> Ptr Event -> CInt -> CUInt
                -> Ptr TimeSpec -> IO CInt
+
+foreign import ccall unsafe "kevent64"
+    c_kevent64_unsafe :: KQueueFd -> Ptr Event -> CInt -> Ptr Event -> CInt -> CUInt
+                      -> Ptr TimeSpec -> IO CInt               
 #elif defined(HAVE_KEVENT)
 foreign import capi safe "sys/event.h kevent"
     c_kevent :: QueueFd -> Ptr Event -> CInt -> Ptr Event -> CInt
              -> Ptr TimeSpec -> IO CInt
+
+foreign import ccall unsafe "kevent"
+    c_kevent_unsafe :: KQueueFd -> Ptr Event -> CInt -> Ptr Event -> CInt
+                    -> Ptr TimeSpec -> IO CInt
 #else
 #error no kevent system call available!?
 #endif
 
 #endif /* defined(HAVE_KQUEUE) */
-

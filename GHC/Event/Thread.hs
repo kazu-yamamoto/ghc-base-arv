@@ -3,6 +3,7 @@
 
 module GHC.Event.Thread
     ( getSystemEventManager
+    , getSystemTimerManager
     , ensureIOManagerIsRunning
     , threadWaitRead
     , threadWaitWrite
@@ -13,22 +14,30 @@ module GHC.Event.Thread
     , registerDelay
     ) where
 
+import Control.Exception (finally)
+import Control.Monad (forM, forM_, zipWithM_)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (Maybe(..))
+import Data.Tuple (snd)
 import Foreign.C.Error (eBADF, errnoToIOError)
 import Foreign.Ptr (Ptr)
 import GHC.Base
 import GHC.Conc.Sync (TVar, ThreadId, ThreadStatus(..), atomically, forkIO,
                       labelThread, modifyMVar_, newTVar, sharedCAF,
+                      numCapabilities, threadCapability, myThreadId, forkOn,
                       threadStatus, writeTVar, newTVarIO, readTVar, retry,throwSTM,STM)
 import GHC.IO (mask_, onException)
 import GHC.IO.Exception (ioError)
+import GHC.IOArray (IOArray, newIOArray, readIOArray, writeIOArray)
 import GHC.MVar (MVar, newEmptyMVar, newMVar, putMVar, takeMVar)
 import GHC.Event.Internal (eventIs, evtClose)
 import GHC.Event.Manager (Event, EventManager, evtRead, evtWrite, loop,
-                             new, registerFd, unregisterFd_, registerTimeout)
+                             new, registerFd, unregisterFd_)
 import GHC.Event.Clock (initializeTimer)
+import qualified GHC.Event.IntMap as IM
 import qualified GHC.Event.Manager as M
+import qualified GHC.Event.TimerManager as TM
+import GHC.Num ((-))
 import System.IO.Unsafe (unsafePerformIO)
 import System.Posix.Types (Fd)
 
@@ -40,10 +49,10 @@ import System.Posix.Types (Fd)
 -- run /earlier/ than specified.
 threadDelay :: Int -> IO ()
 threadDelay usecs = mask_ $ do
-  Just mgr <- getSystemEventManager
+  mgr <- getSystemTimerManager
   m <- newEmptyMVar
-  reg <- registerTimeout mgr usecs (putMVar m ())
-  takeMVar m `onException` M.unregisterTimeout mgr reg
+  reg <- TM.registerTimeout mgr usecs (putMVar m ())
+  takeMVar m `onException` TM.unregisterTimeout mgr reg
 
 -- | Set the value of returned TVar to True after a given number of
 -- microseconds. The caveats associated with threadDelay also apply.
@@ -51,8 +60,8 @@ threadDelay usecs = mask_ $ do
 registerDelay :: Int -> IO (TVar Bool)
 registerDelay usecs = do
   t <- atomically $ newTVar False
-  Just mgr <- getSystemEventManager
-  _ <- registerTimeout mgr usecs . atomically $ writeTVar t True
+  mgr <- getSystemTimerManager
+  _ <- TM.registerTimeout mgr usecs . atomically $ writeTVar t True
   return t
 
 -- | Block the current thread until data is available to read from the
@@ -84,14 +93,27 @@ closeFdWith :: (Fd -> IO ())        -- ^ Action that performs the close.
             -> Fd                   -- ^ File descriptor to close.
             -> IO ()
 closeFdWith close fd = do
-  Just mgr <- getSystemEventManager
-  M.closeFd mgr close fd
+  tableVars <- forM [0,1..numCapabilities-1] (getCallbackTableVar fd)
+  mask_ $ do
+    tables <- forM tableVars (takeMVar.snd)
+    close fd
+    zipWithM_
+      (\(mgr,tableVar) table -> M.closeFd_ mgr table fd >>= putMVar tableVar)
+      tableVars
+      tables
+
+getCallbackTableVar :: Fd
+                       -> Int
+                       -> IO (EventManager, MVar (IM.IntMap [M.FdData]))
+getCallbackTableVar fd cap =
+  do Just (_,!mgr) <- readIOArray eventManager cap
+     return (mgr, M.callbackTableVar mgr fd)
 
 threadWait :: Event -> Fd -> IO ()
 threadWait evt fd = mask_ $ do
   m <- newEmptyMVar
-  Just mgr <- getSystemEventManager
-  reg <- registerFd mgr (\reg e -> unregisterFd_ mgr reg >> putMVar m e) fd evt
+  mgr <- getSystemEventManager
+  reg <- registerFd mgr (\_ e -> putMVar m e) fd evt
   evt' <- takeMVar m `onException` unregisterFd_ mgr reg
   if evt' `eventIs` evtClose
     then ioError $ errnoToIOError "threadWait" eBADF Nothing Nothing
@@ -101,8 +123,8 @@ threadWait evt fd = mask_ $ do
 threadWaitSTM :: Event -> Fd -> IO (STM (), IO ())
 threadWaitSTM evt fd = mask_ $ do
   m <- newTVarIO Nothing
-  Just mgr <- getSystemEventManager 
-  reg <- registerFd mgr (\reg e -> unregisterFd_ mgr reg >> atomically (writeTVar m (Just e))) fd evt
+  mgr <- getSystemEventManager 
+  reg <- registerFd mgr (\_ e -> atomically (writeTVar m (Just e))) fd evt
   let waitAction =
         do mevt <- readTVar m
            case mevt of
@@ -142,41 +164,98 @@ threadWaitWriteSTM = threadWaitSTM evtWrite
 --
 -- This function always returns 'Just' the system event manager when using the
 -- threaded RTS and 'Nothing' otherwise.
-getSystemEventManager :: IO (Maybe EventManager)
-getSystemEventManager = readIORef eventManager
+getSystemEventManager :: IO EventManager
+getSystemEventManager = do
+  t <- myThreadId
+  (cap, _) <- threadCapability t
+  Just (_,mgr) <- readIOArray eventManager cap
+  return mgr
 
 foreign import ccall unsafe "getOrSetSystemEventThreadEventManagerStore"
     getOrSetSystemEventThreadEventManagerStore :: Ptr a -> IO (Ptr a)
 
-eventManager :: IORef (Maybe EventManager)
+eventManager :: IOArray Int (Maybe (ThreadId, EventManager))
 eventManager = unsafePerformIO $ do
-    em <- newIORef Nothing
+    em <- newIOArray (0, numCapabilities - 1) Nothing
     sharedCAF em getOrSetSystemEventThreadEventManagerStore
 {-# NOINLINE eventManager #-}
 
 foreign import ccall unsafe "getOrSetSystemEventThreadIOManagerThreadStore"
     getOrSetSystemEventThreadIOManagerThreadStore :: Ptr a -> IO (Ptr a)
 
-{-# NOINLINE ioManager #-}
-ioManager :: MVar (Maybe ThreadId)
-ioManager = unsafePerformIO $ do
-   m <- newMVar Nothing
+{-# NOINLINE ioManagerLock #-}
+ioManagerLock :: MVar ()
+ioManagerLock = unsafePerformIO $ do
+   m <- newMVar ()
    sharedCAF m getOrSetSystemEventThreadIOManagerThreadStore
+
+getSystemTimerManager :: IO TM.TimerManager
+getSystemTimerManager = do 
+  Just mgr <- readIORef timerManager
+  return mgr
+
+foreign import ccall unsafe "getOrSetSystemTimerThreadEventManagerStore"
+    getOrSetSystemTimerThreadEventManagerStore :: Ptr a -> IO (Ptr a)
+
+timerManager :: IORef (Maybe TM.TimerManager)
+timerManager = unsafePerformIO $ do
+    em <- newIORef Nothing
+    sharedCAF em getOrSetSystemTimerThreadEventManagerStore
+{-# NOINLINE timerManager #-}
+
+foreign import ccall unsafe "getOrSetSystemTimerThreadIOManagerThreadStore"
+    getOrSetSystemTimerThreadIOManagerThreadStore :: Ptr a -> IO (Ptr a)
+
+{-# NOINLINE timerManagerThreadVar #-}
+timerManagerThreadVar :: MVar (Maybe ThreadId)
+timerManagerThreadVar = unsafePerformIO $ do
+   m <- newMVar Nothing
+   sharedCAF m getOrSetSystemTimerThreadIOManagerThreadStore
 
 ensureIOManagerIsRunning :: IO ()
 ensureIOManagerIsRunning
   | not threaded = return ()
   | otherwise = do
       initializeTimer
-      startIOManagerThread
+      startIOManagerThreads
+      startTimerManagerThread
 
-startIOManagerThread :: IO ()
-startIOManagerThread = modifyMVar_ ioManager $ \old -> do
+startIOManagerThreads :: IO ()
+startIOManagerThreads =
+  modifyMVar_ ioManagerLock $ \_ ->
+  forM_ [0,1..numCapabilities-1] startIOManagerThread
+  
+startIOManagerThread :: Int -> IO ()
+startIOManagerThread i = do
   let create = do
-        !mgr <- new
-        writeIORef eventManager $ Just mgr
-        !t <- forkIO $ loop mgr
+        !mgr <- new True
+        !t <- forkOn i $ loop mgr
         labelThread t "IOManager"
+        writeIOArray eventManager i (Just (t,mgr))
+  old <- readIOArray eventManager i
+  case old of
+    Nothing            -> create
+    Just (t,em) -> do
+      s <- threadStatus t
+      case s of
+        ThreadFinished -> create
+        ThreadDied     -> do 
+          -- Sanity check: if the thread has died, there is a chance
+          -- that event manager is still alive. This could happend during
+          -- the fork, for example. In this case we should clean up
+          -- open pipes and everything else related to the event manager.
+          -- See #4449
+          M.cleanup em
+          create
+        _other         -> return ()
+
+startTimerManagerThread :: IO ()
+startTimerManagerThread = modifyMVar_ timerManagerThreadVar $ \old -> do
+  let create = do
+        !mgr <- TM.new
+        writeIORef timerManager $ Just mgr
+        !t <- forkIO $ TM.loop mgr `finally` shutdownManagers
+        labelThread t "TimerManager"
         return $ Just t
   case old of
     Nothing            -> create
@@ -190,11 +269,19 @@ startIOManagerThread = modifyMVar_ ioManager $ \old -> do
           -- the fork, for example. In this case we should clean up
           -- open pipes and everything else related to the event manager.
           -- See #4449
-          mem <- readIORef eventManager
+          mem <- readIORef timerManager
           _ <- case mem of
                  Nothing -> return ()
-                 Just em -> M.cleanup em
+                 Just em -> TM.cleanup em
           create
         _other         -> return st
+
+shutdownManagers :: IO ()
+shutdownManagers =
+  do forM_ [0,1..numCapabilities-1] $ \i -> do
+       mmgr <- readIOArray eventManager i
+       case mmgr of
+         Nothing -> return ()
+         Just (_,mgr) -> M.shutdown mgr
 
 foreign import ccall unsafe "rtsSupportsBoundThreads" threaded :: Bool
