@@ -292,7 +292,7 @@ kevent' safe k chs chlen evs evlen ts =
     kevent safe k chs chlen evs evlen ts `catch` ehandle
   where
     ehandle :: SomeException -> IO Int
-    ehandle e = puts (show e) >> return (-1)
+    ehandle e = puts ("XXX " ++ show e ++ " XXX\n") >> return (-1)
 
 -- TODO: We cannot retry on EINTR as the timeout would be wrong.
 -- Perhaps we should just return without calling any callbacks.
