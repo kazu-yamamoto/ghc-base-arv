@@ -17,7 +17,7 @@ module GHC.Event.KQueue
 import qualified GHC.Event.Internal as E
 
 #include "EventConfig.h"
-#ifdef darwin_HOST_OS /* GHC build freezes if KQueue is enabled. */
+#ifdef darwin_HOST_OS /* GHC build freezes on Mac if KQueue is enabled. */
 # undef HAVE_KQUEUE
 #endif
 
