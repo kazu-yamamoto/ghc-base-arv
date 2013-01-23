@@ -49,6 +49,9 @@ import System.Posix.Internals (c_close)
 import System.Posix.Types (Fd(..))
 import qualified GHC.Event.Array as A
 
+import Control.Exception
+import System.Posix.Internals (puts)
+
 #if defined(HAVE_KEVENT64)
 import Data.Int (Int64)
 import Data.Word (Word64)
@@ -273,15 +276,23 @@ kqueue = KQueueFd `fmap` throwErrnoIfMinus1 "kqueue" c_kqueue
 kqueueControl :: KQueueFd -> Event -> IO ()
 kqueueControl kfd ev = void $
     withTimeSpec (TimeSpec 0 0) $ \tp ->
-        withEvent ev $ \evp -> kevent False kfd evp 1 nullPtr 0 tp
+        withEvent ev $ \evp -> kevent' False kfd evp 1 nullPtr 0 tp
 
 kqueueWait :: KQueueFd -> Ptr Event -> Int -> TimeSpec -> IO Int
 kqueueWait fd es cap tm =
-    withTimeSpec tm $ kevent True fd nullPtr 0 es cap
+    withTimeSpec tm $ kevent' True fd nullPtr 0 es cap
 
 kqueueWaitNonBlock :: KQueueFd -> Ptr Event -> Int -> IO Int
 kqueueWaitNonBlock fd es cap =
-    withTimeSpec (TimeSpec 0 0) $ kevent False fd nullPtr 0 es cap
+    withTimeSpec (TimeSpec 0 0) $ kevent' False fd nullPtr 0 es cap
+
+kevent' :: Bool -> KQueueFd -> Ptr Event -> Int -> Ptr Event -> Int -> Ptr TimeSpec
+       -> IO Int
+kevent' safe k chs chlen evs evlen ts =
+    kevent safe k chs chlen evs evlen ts `catch` ehandle
+  where
+    ehandle :: SomeException -> IO Int
+    ehandle e = puts (show e) >> return (-1)
 
 -- TODO: We cannot retry on EINTR as the timeout would be wrong.
 -- Perhaps we should just return without calling any callbacks.
