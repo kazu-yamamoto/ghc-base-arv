@@ -286,8 +286,14 @@ registerFd_ mgr@(EventManager{..}) cb fd evs = do
     if haveOneShot && emOneShot
     then case IM.insertWith (++) fd' [fdd] oldMap of
       (Nothing,   n) -> do I.modifyFdOnce emBackend fd evs
+#ifdef darwin_HOST_OS
+                           sendWakeup emControl
+#endif
                            return (n, (reg, False))
       (Just prev, n) -> do I.modifyFdOnce emBackend fd (combineEvents evs prev)
+#ifdef darwin_HOST_OS
+                           sendWakeup emControl
+#endif
                            return (n, (reg, False))
     else
       let (!newMap, (oldEvs, newEvs)) =
