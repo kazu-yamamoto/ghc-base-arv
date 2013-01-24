@@ -75,6 +75,8 @@ import System.Posix.Types (Fd)
 import qualified GHC.Event.IntMap as IM
 import qualified GHC.Event.Internal as I
 
+import System.Posix.Internals (puts)
+
 #if defined(HAVE_KQUEUE)
 import qualified GHC.Event.KQueue as KQueue
 #elif defined(HAVE_EPOLL)
@@ -286,8 +288,10 @@ registerFd_ mgr@(EventManager{..}) cb fd evs = do
     if haveOneShot && emOneShot
     then case IM.insertWith (++) fd' [fdd] oldMap of
       (Nothing,   n) -> do I.modifyFdOnce emBackend fd evs
+                           sendWakeup emControl
                            return (n, (reg, False))
       (Just prev, n) -> do I.modifyFdOnce emBackend fd (combineEvents evs prev)
+                           sendWakeup emControl
                            return (n, (reg, False))
     else
       let (!newMap, (oldEvs, newEvs)) =
@@ -397,24 +401,26 @@ closeFd_ mgr oldMap fd = do
 
 -- | Call the callbacks corresponding to the given file descriptor.
 onFdEvent :: EventManager -> Fd -> Event -> IO ()
-onFdEvent mgr fd evs =
-  if fd == controlReadFd (emControl mgr) || fd == wakeupReadFd (emControl mgr)
-  then handleControlEvent mgr fd evs
-  else
-    if emOneShot mgr
-    then
-      do fdds <- modifyMVar (callbackTableVar mgr fd) $ \oldMap ->
-            case IM.delete fd' oldMap of
-              (Nothing, _)       -> return (oldMap, [])
-              (Just cbs, newmap) -> selectCallbacks newmap cbs
-         forM_ fdds $ \(FdData reg _ cb) -> cb reg evs
-    else
-      do fds <- readMVar (callbackTableVar mgr fd)
-         case IM.lookup fd' fds of
-           Just cbs -> forM_ cbs $ \(FdData reg ev cb) -> do
-             when (evs `I.eventIs` ev) $ cb reg evs
-           Nothing  -> return ()
+onFdEvent mgr fd evs
+  | isControl = handleControlEvent mgr fd evs
+  | emOneShot mgr = do
+      fdds <- modifyMVar (callbackTableVar mgr fd) $ \oldMap ->
+          case IM.delete fd' oldMap of
+              (Nothing, _)       -> do
+                  puts $ "XXX " ++ show fd' ++ " did not exist XXX\n"
+                  return (oldMap, [])
+              (Just cbs, newMap) -> selectCallbacks newMap cbs
+      forM_ fdds $ \(FdData reg _ cb) -> cb reg evs
+  | otherwise = do
+      fds <- readMVar (callbackTableVar mgr fd)
+      case IM.lookup fd' fds of
+          Just cbs -> forM_ cbs $ \(FdData reg ev cb) -> do
+              when (evs `I.eventIs` ev) $ cb reg evs
+          Nothing  -> return ()
   where
+    isControl = fd == controlReadFd (emControl mgr)
+             || fd ==  wakeupReadFd (emControl mgr)
+
     fd' :: Int
     fd' = fromIntegral fd
 
