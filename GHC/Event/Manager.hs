@@ -286,6 +286,14 @@ registerFd_ mgr@(EventManager{..}) cb fd evs = do
     if haveOneShot && emOneShot
     then case IM.insertWith (++) fd' [fdd] oldMap of
       (Nothing,   n) -> do I.modifyFdOnce emBackend fd evs
+{-
+    Building GHC with parallel IO manager on Mac freezes when compiling
+    the dph libraries in the phase 2. As workaround, we wake up IO
+    manager on Mac every time when we register an event.
+
+    For more information, please read:
+        http://hackage.haskell.org/trac/ghc/ticket/7651
+-}
 #ifdef darwin_HOST_OS
                            sendWakeup emControl
 #endif
